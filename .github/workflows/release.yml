@@ -2,6 +2,8 @@ name: Release
 
 # Run by hand with a version to publish a release (R-GP2):
 #   gh workflow run release.yml --ref main -f release_version=X.Y.Z
+# A release candidate X.Y.Z-rcN is published the same way, as a GitHub
+# prerelease.
 # A pull request runs the same build and tests as a dry run, and publishes
 # nothing. The structure is the "Minimal Package Release" of
 # roc-lang/release-package README.md. Template: see README.md next to this file.
@@ -9,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       release_version:
-        description: "Release version X.Y.Z, for example 0.1.0 (no v prefix, no -rc suffix)"
+        description: "Release version X.Y.Z or a release candidate X.Y.Z-rcN, for example 0.1.0 or 0.1.0-rc1 (no v prefix)"
         required: true
         type: string
   pull_request:
@@ -78,12 +80,15 @@ jobs:
           dry_run: ${{ github.event_name != 'workflow_dispatch' }}
           github_token: ${{ github.token }}
 
-      # validate-release accepts 1.2.3-rc1 and publish-release then marks the
-      # release as a prerelease. R-GP2 needs X.Y.Z only.
-      - name: Require a stable X.Y.Z version
+      # validate-release accepts each semver prerelease suffix, and
+      # publish-release then marks the release as a prerelease. R-GP2 needs
+      # X.Y.Z for a release. The one suffix accepted here is -rcN, for a
+      # release candidate.
+      - name: Require X.Y.Z or a release candidate X.Y.Z-rcN
         env:
           IS_PRERELEASE: ${{ steps.validate.outputs.is_prerelease }}
-        run: test "$IS_PRERELEASE" = false || { echo "Release version must be X.Y.Z with no prerelease suffix" >&2; exit 1; }
+          RELEASE_VERSION: ${{ steps.validate.outputs.release_version }}
+        run: test "$IS_PRERELEASE" = false || [[ "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+-rc[1-9][0-9]*$ ]] || { echo "Release version must be X.Y.Z or X.Y.Z-rcN" >&2; exit 1; }
 
       - name: roc check and roc test
         run: |
@@ -240,8 +245,8 @@ jobs:
           release_version: ${{ needs.build.outputs.release_version }}
           github_token: ${{ github.token }}
 
-      # One gh release create call with all assets: not a draft, and not a
-      # prerelease for X.Y.Z. No additional_assets, so one .tar.zst only.
+      # One gh release create call with all assets: not a draft, a prerelease
+      # for X.Y.Z-rcN only. No additional_assets, so one .tar.zst only.
       - name: Publish release
         uses: roc-lang/release-package/actions/publish-release@af2f0cd8662874b825ff3917f4286e793ba18c55
         with:
@@ -260,6 +265,6 @@ jobs:
           jq -e --arg v "$RELEASE_VERSION" --arg a "$expected" '
             .tagName == $v
             and .isDraft == false
-            and .isPrerelease == false
+            and .isPrerelease == ($v | contains("-rc"))
             and ([.assets[].name | select(endswith(".tar.zst"))] == [$a])
           ' .release/published.json
