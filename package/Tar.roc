@@ -1,5 +1,6 @@
 ## A streaming reader for ustar archives (POSIX.1-1988 ustar, plus the pax
-## `x` and `g` headers and the GNU `L` and `K` headers).
+## `x` and `g` headers and the GNU `L` and `K` headers), and a writer of
+## ustar archives with pax `x` headers.
 ##
 ## A `Tar` is the state of one read. Give it the archive in chunks of any size
 ## with `push`, then call `finish` once. Each member gives one `Entry` event.
@@ -10,6 +11,9 @@
 ## The reader keeps at most one partial header (less than 512 bytes), the data
 ## of the member or meta header that it collects now, and the pax values that
 ## apply to the next member. It never keeps the data of a member that it skips.
+##
+## `Tar.create` writes an archive of a list of members, and `Tar.writer` one
+## member at a time. The bytes are a function of the members only.
 Tar :: {
 	limits : Tar.Limits,
 	# The count of archive bytes that the reader consumed.
@@ -147,7 +151,7 @@ Tar :: {
 					take = U64.min(left, n - $i)
 					piece_buf = match sink {
 						Skip => $t.buf
-						_ => add($t.buf, chunk.sublist({ start: $i, len: take }))
+						_ => add_piece($t.buf, chunk.sublist({ start: $i, len: take }))
 					}
 					$i = $i + take
 					$t = { ..$t, offset: $t.offset + take, buf: piece_buf }
@@ -184,7 +188,7 @@ Tar :: {
 					} else {
 						take = U64.min(block_size - have, n - $i)
 						start = if (have == 0) List.with_capacity(block_size) else $t.pending
-						pending = add(start, chunk.sublist({ start: $i, len: take }))
+						pending = add_piece(start, chunk.sublist({ start: $i, len: take }))
 						$i = $i + take
 						if pending.len() == block_size {
 							match on_block({ ..$t, pending: [], at: $t.offset - have, offset: $t.offset + take }, pending, choose) {
@@ -392,6 +396,123 @@ Tar :: {
 			}
 			"tar: the input ends at offset ${offset.to_str()}, in ${where_}"
 		}
+	}
+
+	## One member to write. `Tar.file`, `Tar.dir`, `Tar.symlink` and
+	## `Tar.hard_link` give a member with the fixed defaults; change a field
+	## with `{ ..Tar.file(path, data), mtime: 315532800 }`. The writer reads
+	## no clock, no user and no file: the archive is a function of the members.
+	Member : {
+		path : Str,
+		kind : [File(List(U8)), Dir, Symlink(Str), HardLink(Str)],
+		mode : U32,
+		mtime : U64,
+		uid : U64,
+		gid : U64,
+		uname : Str,
+		gname : Str,
+	}
+
+	## The errors of the writer. Each has the path of the member.
+	WriteError : [
+		BadPath({ path : Str, problem : [Empty, HasNul, Absolute, EmptyPart, DotPart, ParentDir, TrailingSlash] }),
+		BadLink({ path : Str, problem : [Empty, HasNul, NotEarlierFile] }),
+		BadOwnerName({ path : Str }),
+		BadMode({ path : Str, mode : U32 }),
+		DuplicatePath({ path : Str }),
+	]
+
+	## An archive that is written one member at a time: see `Tar.writer`. It
+	## keeps the paths that it wrote, never the data of a member.
+	Writer :: { paths : Set(Str), files : Set(Str) }.{
+
+		## Write one member: a pax `x` header when a field does not fit in the
+		## ustar header, then the ustar header, the data and the padding to 512
+		## bytes, as one chunk.
+		add : Tar.Writer, Tar.Member -> Try({ writer : Tar.Writer, chunk : List(U8) }, Tar.WriteError)
+		add = |w, m| {
+			key = check_member(m, w.paths, w.files)?
+			files = match m.kind {
+				File(_) | HardLink(_) => w.files.insert(key)
+				_ => w.files
+			}
+			Ok({ writer: { paths: w.paths.insert(key), files }, chunk: member_bytes(m) })
+		}
+
+		## The last chunk of the archive: two zero blocks.
+		end : Tar.Writer -> List(U8)
+		end = |_w| List.repeat(0, 2 * block_size)
+	}
+
+	## A regular file with this data. Mode 0o644, mtime 0, uid and gid 0,
+	## uname and gname empty.
+	file : Str, List(U8) -> Tar.Member
+	file = |path, data| member_of(path, File(data), 0o644)
+
+	## A directory. Mode 0o755. The writer writes the path as it is: give
+	## `"dir/"` for the form of GNU tar and bsdtar.
+	dir : Str -> Tar.Member
+	dir = |path| member_of(path, Dir, 0o755)
+
+	## A symbolic link to `target`. Mode 0o777. The target is not checked
+	## (it can be absolute or have `..`), only that it is not empty and has
+	## no NUL byte.
+	symlink : Str, Str -> Tar.Member
+	symlink = |path, target| member_of(path, Symlink(target), 0o777)
+
+	## A hard link to `target`, the path of an earlier regular file or hard
+	## link of the same archive. Mode 0o644.
+	hard_link : Str, Str -> Tar.Member
+	hard_link = |path, target| member_of(path, HardLink(target), 0o644)
+
+	## Start an archive that is written one member at a time. Each
+	## `Tar.Writer.add` gives the next chunk, and `Tar.Writer.end` the last
+	## one. The chunks, in order, are the bytes of `Tar.create` for the same
+	## members.
+	writer : {} -> Tar.Writer
+	writer = |{}| { paths: Set.empty(), files: Set.empty() }
+
+	## The archive of these members, in this order, then two zero blocks.
+	create : List(Tar.Member) -> Try(List(U8), Tar.WriteError)
+	create = |members| {
+		var $w = Tar.writer({})
+		var $out = []
+		for m in members {
+			added = $w.add(m)?
+			$w = added.writer
+			$out = $out.concat(added.chunk)
+		}
+		Ok($out.concat($w.end()))
+	}
+
+	## A text for each writer error, in English.
+	write_err_to_str : Tar.WriteError -> Str
+	write_err_to_str = |err| match err {
+		BadPath({ path, problem }) => {
+			why = match problem {
+				Empty => "is empty"
+				HasNul => "has a NUL byte"
+				Absolute => "starts with /"
+				EmptyPart => "has an empty part (two / together)"
+				DotPart => "has a part that is ."
+				ParentDir => "has a part that is .."
+				TrailingSlash => "ends with /, but the member is not a directory"
+			}
+			"tar: the path \"${path}\" ${why}"
+		}
+
+		BadLink({ path, problem }) => {
+			why = match problem {
+				Empty => "is empty"
+				HasNul => "has a NUL byte"
+				NotEarlierFile => "is not the path of an earlier regular file or hard link of the archive"
+			}
+			"tar: the link target of \"${path}\" ${why}"
+		}
+
+		BadOwnerName({ path }) => "tar: the uname or gname of \"${path}\" has a NUL byte"
+		BadMode({ path, mode }) => "tar: the mode 0o${octal_text(mode.to_u64())} of \"${path}\" is more than 0o7777 (the type bits are not part of the mode)"
+		DuplicatePath({ path }) => "tar: the path \"${path}\" is already in the archive"
 	}
 }
 
@@ -609,8 +730,8 @@ kind_of = |type| match type {
 # all its bytes (List.with_capacity). A concat to an empty list gives the
 # second list back, which can be a slice of a chunk and keep all of the chunk;
 # so the first byte is an append.
-add : List(U8), List(U8) -> List(U8)
-add = |buf, piece| match piece {
+add_piece : List(U8), List(U8) -> List(U8)
+add_piece = |buf, piece| match piece {
 	[] => buf
 	[first, .. as rest] => if (buf.is_empty()) buf.append(first).concat(rest) else buf.concat(piece)
 }
@@ -813,4 +934,241 @@ decimal = |digits| {
 		}
 	}
 	Ok($value)
+}
+
+# The writer: a member with the fixed defaults.
+member_of : Str, [File(List(U8)), Dir, Symlink(Str), HardLink(Str)], U32 -> Tar.Member
+member_of = |path, kind, mode| { path, kind, mode, mtime: 0, uid: 0, gid: 0, uname: "", gname: "" }
+
+# The checks of one member. Gives the key of the path: the path with no `/`
+# at the end (a directory can have one), so `a` and `a/` are the same path.
+check_member : Tar.Member, Set(Str), Set(Str) -> Try(Str, Tar.WriteError)
+check_member = |m, paths, files| {
+	path = m.path
+	is_dir = m.kind == Dir
+	key = check_write_path(path, is_dir) ? |problem| BadPath({ path, problem })
+	match m.kind {
+		Symlink(target) => check_target(target) ? |problem| BadLink({ path, problem })
+		HardLink(target) => {
+			check_target(target) ? |problem| BadLink({ path, problem })
+			if !files.contains(target) {
+				return Err(BadLink({ path, problem: NotEarlierFile }))
+			}
+		}
+
+		_ => {}
+	}
+	if m.uname.to_utf8().contains(0) or m.gname.to_utf8().contains(0) {
+		return Err(BadOwnerName({ path: path }))
+	}
+	if m.mode > 0o7777 {
+		return Err(BadMode({ path, mode: m.mode }))
+	}
+	if paths.contains(key) {
+		return Err(DuplicatePath({ path: path }))
+	}
+	Ok(key)
+}
+
+# A path that the writer accepts: not empty, no NUL, no `/` at the start,
+# and parts between single `/` that are not empty, `.` or `..`. Only a
+# directory can end with one `/`.
+check_write_path : Str, Bool -> Try(Str, [Empty, HasNul, Absolute, EmptyPart, DotPart, ParentDir, TrailingSlash])
+check_write_path = |path, is_dir| {
+	bytes = path.to_utf8()
+	if bytes.is_empty() {
+		return Err(Empty)
+	}
+	if bytes.contains(0) {
+		return Err(HasNul)
+	}
+	if bytes.first() == Ok('/') {
+		return Err(Absolute)
+	}
+	ends_with_slash = bytes.last() == Ok('/')
+	if ends_with_slash and !is_dir {
+		return Err(TrailingSlash)
+	}
+	key = if (ends_with_slash) bytes.drop_last(1) else bytes
+	for part in key.split_on('/') {
+		if part.is_empty() {
+			return Err(EmptyPart)
+		}
+		if part == ['.'] {
+			return Err(DotPart)
+		}
+		if part == ['.', '.'] {
+			return Err(ParentDir)
+		}
+	}
+	Ok(Str.from_utf8(key) ?? path)
+}
+
+check_target : Str -> Try({}, [Empty, HasNul])
+check_target = |target| {
+	bytes = target.to_utf8()
+	if bytes.is_empty() {
+		Err(Empty)
+	} else if bytes.contains(0) {
+		Err(HasNul)
+	} else {
+		Ok({})
+	}
+}
+
+# The largest values of the octal fields: 7 digits (mode, uid, gid) and 11
+# digits (size, mtime).
+max_octal_7 : U64
+max_octal_7 = 0o7777777
+
+max_octal_11 : U64
+max_octal_11 = 0o77777777777
+
+# The chunk of one checked member: a pax `x` header if a field does not fit,
+# the ustar header, the data, the padding.
+member_bytes : Tar.Member -> List(U8)
+member_bytes = |m| {
+	path = m.path.to_utf8()
+	(type, link, data) = match m.kind {
+		File(d) => ('0', [], d)
+		Dir => ('5', [], [])
+		Symlink(t) => ('2', t.to_utf8(), [])
+		HardLink(t) => ('1', t.to_utf8(), [])
+	}
+	size = data.len()
+	(prefix, name, path_rec) = match ustar_split(path) {
+		Ok((p, n)) => (p, n, [])
+		Err(NoSplit) => ([], fit(path, 100), pax_record("path", path))
+	}
+	(link_field, link_rec) = if (link.len() <= 100) (link, []) else (fit(link, 100), pax_record("linkpath", link))
+	(size_field, size_rec) = number(size, max_octal_11, "size")
+	(uid_field, uid_rec) = number(m.uid, max_octal_7, "uid")
+	(gid_field, gid_rec) = number(m.gid, max_octal_7, "gid")
+	(mtime_field, mtime_rec) = number(m.mtime, max_octal_11, "mtime")
+	uname = m.uname.to_utf8()
+	gname = m.gname.to_utf8()
+	(uname_field, uname_rec) = if (uname.len() <= 31) (uname, []) else (fit(uname, 31), pax_record("uname", uname))
+	(gname_field, gname_rec) = if (gname.len() <= 31) (gname, []) else (fit(gname, 31), pax_record("gname", gname))
+	# The records in the order of their keys.
+	records = gid_rec.concat(gname_rec).concat(link_rec).concat(mtime_rec).concat(path_rec).concat(size_rec).concat(uid_rec).concat(uname_rec)
+	pax = if records.is_empty() {
+		[]
+	} else {
+		ustar_header({ name: "././@PaxHeader".to_utf8(), prefix: [], mode: 0o644, uid: 0, gid: 0, size: records.len(), mtime: 0, type: 'x', link: [], uname: [], gname: [] })
+			.concat(records)
+			.concat(List.repeat(0, pad_of(records.len())))
+	}
+	header = ustar_header({ name, prefix, mode: m.mode.to_u64(), uid: uid_field, gid: gid_field, size: size_field, mtime: mtime_field, type, link: link_field, uname: uname_field, gname: gname_field })
+	List.with_capacity(pax.len() + block_size + size + pad_of(size))
+		.concat(pax)
+		.concat(header)
+		.concat(data)
+		.concat(List.repeat(0, pad_of(size)))
+}
+
+# A number for an octal field, or 0 and a pax record when it does not fit.
+number : U64, U64, Str -> (U64, List(U8))
+number = |value, max, key| if (value <= max) (value, []) else (0, pax_record(key, value.to_str().to_utf8()))
+
+# The octal digits of a number, with no leading zero.
+octal_text : U64 -> Str
+octal_text = |value| {
+	var $digits = []
+	var $v = value
+	while $digits.is_empty() or $v > 0 {
+		$digits = $digits.prepend('0' + ($v % 8).to_u8_wrap())
+		$v = $v // 8
+	}
+	Str.from_utf8($digits) ?? ""
+}
+
+pad_of : U64 -> U64
+pad_of = |n| (block_size - n % block_size) % block_size
+
+# The path in the ustar prefix and name fields: the name alone when it has
+# at most 100 bytes, else split at the first `/` that leaves at most 100
+# bytes after it and at most 155 bytes before it, with neither part empty
+# (as GNU tar). `NoSplit` when no `/` fits.
+ustar_split : List(U8) -> Try((List(U8), List(U8)), [NoSplit])
+ustar_split = |path| {
+	n = path.len()
+	if n <= 100 {
+		return Ok(([], path))
+	}
+	var $k = n - 101
+	while $k <= 155 and $k < n - 1 {
+		if path.get($k) == Ok('/') and $k > 0 {
+			return Ok((path.take_first($k), path.drop_first($k + 1)))
+		}
+		$k = $k + 1
+	}
+	Err(NoSplit)
+}
+
+# The first bytes of `bytes`, at most `n`, cut at the start of a UTF-8
+# character, for a field that a pax record replaces.
+fit : List(U8), U64 -> List(U8)
+fit = |bytes, n| {
+	var $k = U64.min(n, bytes.len())
+	while $k > 0 and $k < bytes.len() and (bytes.get($k) ?? 0).bitwise_and(0xC0) == 0x80 {
+		$k = $k - 1
+	}
+	bytes.take_first($k)
+}
+
+# One pax record: "<length> <key>=<value>\n", where <length> counts its own
+# digits.
+pax_record : Str, List(U8) -> List(U8)
+pax_record = |key, value| {
+	text = [' '].concat(key.to_utf8()).append('=').concat(value).append('\n')
+	var $n = text.len() + 1
+	while $n != text.len() + $n.to_str().count_utf8_bytes() {
+		$n = $n + 1
+	}
+	$n.to_str().to_utf8().concat(text)
+}
+
+UstarFields : { name : List(U8), prefix : List(U8), mode : U64, uid : U64, gid : U64, size : U64, mtime : U64, type : U8, link : List(U8), uname : List(U8), gname : List(U8) }
+
+# A 512-byte POSIX ustar header (magic "ustar\0", version "00"). The numbers
+# are octal with leading zeros and a NUL; the checksum is 6 digits, NUL and
+# space (as GNU tar). The device numbers are 0.
+ustar_header : UstarFields -> List(U8)
+ustar_header = |f| {
+	fields = field(f.name, 100)
+		.concat(octal_field(f.mode, 8))
+		.concat(octal_field(f.uid, 8))
+		.concat(octal_field(f.gid, 8))
+		.concat(octal_field(f.size, 12))
+		.concat(octal_field(f.mtime, 12))
+		.concat(List.repeat(' ', 8))
+		.append(f.type)
+		.concat(field(f.link, 100))
+		.concat(['u', 's', 't', 'a', 'r', 0, '0', '0'])
+		.concat(field(f.uname, 32))
+		.concat(field(f.gname, 32))
+		.concat(octal_field(0, 8))
+		.concat(octal_field(0, 8))
+		.concat(field(f.prefix, 155))
+		.concat(List.repeat(0, 12))
+	sum = fields.fold(0.U64, |acc, b| acc + b.to_u64())
+	fields.take_first(148).concat(octal_field(sum, 7)).append(' ').concat(fields.drop_first(156))
+}
+
+# The bytes and NUL bytes to `width`.
+field : List(U8), U64 -> List(U8)
+field = |bytes, width| bytes.concat(List.repeat(0, width - bytes.len()))
+
+# `width - 1` octal digits with leading zeros, then NUL.
+octal_field : U64, U64 -> List(U8)
+octal_field = |value, width| {
+	var $digits = List.repeat('0', width - 1)
+	var $v = value
+	var $k = width - 1
+	while $k > 0 {
+		$k = $k - 1
+		$digits = $digits.set($k, '0' + ($v % 8).to_u8_wrap()) ?? $digits
+		$v = $v // 8
+	}
+	$digits.append(0)
 }

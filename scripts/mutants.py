@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # Mutation check of the L0 tests: each mutant changes one tricky rule of
-# package/Tar.roc, runs `roc test` on each tests/*.roc, records which files
-# have a failed expect (a run of more than 120 s counts as a fail), and restores
-# the file. A mutant that no test kills (or that only gives compile errors) exits 1.
+# package/Tar.roc (M1 to M17 the reader, M18 to M24 the writer), runs
+# `roc test` on each tests/*.roc, records which files have a failed expect
+# (a run of more than 120 s counts as a fail), and restores the file. A mutant that no test kills (or that only gives compile errors) exits 1.
 # Usage: python3 -I scripts/mutants.py ROC [ID...]
 import pathlib, re, signal, subprocess, sys
 
@@ -47,6 +47,20 @@ MUTANTS = [
     ("M17", "roc_accepts: a link target is checked with '/' as the only separator",
      "for part in parts(bytes) {\n\t\tif part == ['.', '.'] {\n\t\t\treturn Err(ParentDir)\n\t\t}\n\t\tif part == ['.'] {\n\t\t\treturn Err(DotPart)\n\t\t}\n\t}\n\tOk({})",
      "for part in bytes.split_on('/') {\n\t\tif part == ['.', '.'] {\n\t\t\treturn Err(ParentDir)\n\t\t}\n\t\tif part == ['.'] {\n\t\t\treturn Err(DotPart)\n\t\t}\n\t}\n\tOk({})"),
+    ("M18", "writer: a ustar prefix of 156 bytes is used",
+     "while $k <= 155 and $k < n - 1 {", "while $k <= 156 and $k < n - 1 {"),
+    ("M19", "writer: a path of 100 bytes is not in the name field alone",
+     "if n <= 100 {\n\t\treturn Ok(([], path))", "if n < 100 {\n\t\treturn Ok(([], path))"),
+    ("M20", "writer: a cut name field ends in the middle of a UTF-8 character",
+     ".bitwise_and(0xC0) == 0x80 {", ".bitwise_and(0xC0) == 0x40 {"),
+    ("M21", "writer: the checksum counts the checksum field as NUL bytes, not spaces",
+     ".concat(List.repeat(' ', 8))\n\t\t.append(f.type)", ".concat(List.repeat(0, 8))\n\t\t.append(f.type)"),
+    ("M22", "writer: a uname of 32 bytes is in the field (no NUL), not in a pax record",
+     "(uname_field, uname_rec) = if (uname.len() <= 31)", "(uname_field, uname_rec) = if (uname.len() <= 32)"),
+    ("M23", "writer: a hard link cannot have a hard link as its target",
+     "File(_) | HardLink(_) => w.files.insert(key)", "File(_) => w.files.insert(key)"),
+    ("M24", "writer: an mtime of 8589934592 (more than 11 octal digits) is not a pax record",
+     'number(m.mtime, max_octal_11, "mtime")', 'number(m.mtime, max_octal_11 + 1, "mtime")'),
 ]
 HELPER = "\npick_global = |g, h| match g {\n\tSet(x) => x\n\t_ => h\n}\n"
 

@@ -1,0 +1,15 @@
+drwxr-xr-x 0 pkg/
+-rwxr-xr-x 15 pkg/main.roc
+-rw-r--r-- 0 pkg/empty
+-rw-r--r-- 1000 pkg/zeta.bin
+drwxr-xr-x 0 pkg/mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm/mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm/
+-rw-r--r-- 5 pkg/mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm/mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm/Deep.roc
+-rw-r--r-- 5 pkg/LLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLL/Long.roc
+lrwxrwxrwx 0 pkg/link.roc -> main.roc
+lrwxrwxrwx 0 pkg/far -> ../LLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLL/LLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLL/target
+hrw-r--r-- 0 pkg/hard.bin link to pkg/zeta.bin
+-rw-r--r-- 2 pkg/owned
+-rw-r--r-- 2 pkg/big-ids
+-rw-r--r-- 2 pkg/late
+-rw-r--r-- 2 pkg/ünïcödé-ナ.txt
+end
