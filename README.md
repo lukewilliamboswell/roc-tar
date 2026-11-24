@@ -1,12 +1,12 @@
 # roc-tar
 
-A streaming reader for tar archives (ustar, pax, GNU long names) in pure Roc. No effects, no dependencies. Give it the archive in chunks of any size. It gives an event for each member, and keeps no data of a member that you skip.
+A streaming reader for tar archives (ustar, pax, GNU long names), and a writer of ustar archives, in pure Roc. No effects, no dependencies. Give the reader the archive in chunks of any size. It gives an event for each member, and keeps no data of a member that you skip. The writer gives the same bytes for the same members on each machine: it reads no clock, no user and no file.
 
 It is made for the registry Worker of [Talon](https://github.com/Karakatiza666/talon) (Registry R-PU38): a `.tar.zst` Roc bundle goes through BLAKE3 and a zstd decoder in chunks, and this reader keeps only the header file and the list of paths.
 
 ## API
 
-One module, `Tar`. The value of type `Tar` is the state of one read.
+One module, `Tar`. The value of type `Tar` is the state of one read. The value of type `Tar.Writer` is the state of one write.
 
 | Function | Type |
 | --- | --- |
@@ -18,6 +18,15 @@ One module, `Tar`. The value of type `Tar` is the state of one read.
 | `Tar.roc_accepts` | `Tar.Entry -> Try({}, [UnsupportedType(U8), Path(...), Link([Absolute, DriveLetter, ParentDir, DotPart])])` (`Path` has the errors of `check_portable_path`) |
 | `Tar.held_bytes` | `Tar -> U64` |
 | `Tar.err_to_str` | `Tar.Error -> Str` |
+| `Tar.create` | `List(Tar.Member) -> Try(List(U8), Tar.WriteError)` |
+| `Tar.writer` | `{} -> Tar.Writer` |
+| `Tar.Writer.add` | `Tar.Writer, Tar.Member -> Try({ writer : Tar.Writer, chunk : List(U8) }, Tar.WriteError)` |
+| `Tar.Writer.end` | `Tar.Writer -> List(U8)` |
+| `Tar.file` | `Str, List(U8) -> Tar.Member` |
+| `Tar.dir` | `Str -> Tar.Member` |
+| `Tar.symlink` | `Str, Str -> Tar.Member` (the path, then the target) |
+| `Tar.hard_link` | `Str, Str -> Tar.Member` (the path, then the target) |
+| `Tar.write_err_to_str` | `Tar.WriteError -> Str` |
 
 | Type | Definition |
 | --- | --- |
@@ -28,6 +37,9 @@ One module, `Tar`. The value of type `Tar` is the state of one read.
 | `Tar.End` | `[TwoZeroBlocks, OneZeroBlock, NoZeroBlock]` |
 | `Tar.Summary` | `{ end : Tar.End, members : U64, bytes : U64, total_size : U64 }` |
 | `Tar.Limits` | A nominal record. Each field has a default, so `Tar.Limits.{}` gives all defaults (table below). |
+| `Tar.Member` | `{ path : Str, kind : [File(List(U8)), Dir, Symlink(Str), HardLink(Str)], mode : U32, mtime : U64, uid : U64, gid : U64, uname : Str, gname : Str }` |
+| `Tar.WriteError` | A closed tag union (see "Write errors") |
+| `Tar.Writer` | The paths that the writer wrote. Never the data of a member. |
 
 ### How to read
 
@@ -45,6 +57,8 @@ One module, `Tar`. The value of type `Tar` is the state of one read.
 After the end, the caller can push more chunks: zero bytes are good (GNU tar pads to 10240 bytes), and a byte that is not zero is `DataAfterEnd`. So the caller can push every chunk that it hashes, also when it has all that it needs.
 
 After an error, do not push again. The caller can still hash the rest of the stream.
+
+An archive that is all in memory is one chunk: `Tar.new(limits).push(bytes, choose)?`, then `finish()?`. Raise `max_total_size` and `max_collect_bytes` when you collect more than their defaults.
 
 ### Entry fields
 
@@ -172,6 +186,93 @@ The bound: at each meta header, the reader checks that its data size plus the va
 
 The reader never keeps a slice of a chunk: a Roc `List.sublist` or `Str.from_utf8` can share the memory of the whole chunk, so the reader copies the bytes that it keeps. Without this copy, the list of paths kept a reference to a decoded chunk for each member, and the live memory of the measure app was 6 MB more (see Measurement).
 
+### How to write
+
+1. Make the members: `Tar.file(path, data)`, `Tar.dir(path)`, `Tar.symlink(path, target)`, `Tar.hard_link(path, target)`. Change a field with a record update: `{ ..Tar.file(path, data), mode: 0o755, mtime: 315532800 }`.
+2. All at once: `Tar.create(members)` gives the archive.
+3. Or one member at a time: `Tar.writer({})`, then for each member `writer.add(member)?` gives `{ writer, chunk }`, and at the end `writer.end()` gives the last chunk. The chunks, in order, are the bytes of `Tar.create` for the same members.
+
+```roc
+import tar.Tar
+
+## A file and a link, with a fixed mtime (1980-01-01).
+archive : Try(List(U8), Tar.WriteError)
+archive = Tar.create([
+	Tar.dir("pkg/"),
+	{ ..Tar.file("pkg/main.roc", "app [main!] {}\n".to_utf8()), mtime: 315532800 },
+	Tar.symlink("pkg/link.roc", "main.roc"),
+])
+
+## The same archive as chunks: one for each member, then the end.
+chunks : List(Tar.Member) -> Try(List(List(U8)), Tar.WriteError)
+chunks = |members| {
+	var $w = Tar.writer({})
+	var $out = []
+	for m in members {
+		added = $w.add(m)?
+		$w = added.writer
+		$out = $out.append(added.chunk)
+	}
+	Ok($out.append($w.end()))
+}
+```
+
+### Member fields
+
+| Field | Default | In the archive |
+| --- | --- | --- |
+| `path` | | As you give it. The writer adds no `/` to a directory: give `"dir/"` for the form of GNU tar and bsdtar. |
+| `kind` | | `File(data)` is type `0`, `Dir` is `5`, `Symlink(target)` is `2`, `HardLink(target)` is `1`. Only a file has data. |
+| `mode` | 0o644 (file, hard link), 0o755 (dir), 0o777 (symbolic link) | The permission bits, at most 0o7777 |
+| `mtime` | 0 | Seconds after 1970-01-01 UTC |
+| `uid`, `gid` | 0 | |
+| `uname`, `gname` | `""` | |
+
+Each member gets one 512-byte POSIX ustar header (magic `ustar\0`, version `00`), its data, and zero bytes to a multiple of 512. The archive ends with two zero blocks, with no padding to a record of 10240 bytes (as `roc bundle`). The numbers are octal with leading zeros and a NUL. The checksum is 6 digits, NUL and space (as GNU tar). The device numbers are 0.
+
+### Fields that do not fit
+
+| Field | Fits in the ustar header | Else |
+| --- | --- | --- |
+| `path` | At most 100 bytes in the name field, or split at a `/` into the prefix field (at most 155 bytes) and the name field (at most 100 bytes). The split is at the first `/` that leaves at most 100 bytes after it (as GNU tar). | A pax `path` record |
+| link target | At most 100 bytes | A pax `linkpath` record |
+| size | At most 8589934591 (11 octal digits, 8 GiB less 1 byte) | A pax `size` record |
+| `mtime` | At most 8589934591 (the year 2242) | A pax `mtime` record |
+| `uid`, `gid` | At most 2097151 (7 octal digits) | A pax `uid`, `gid` record |
+| `uname`, `gname` | At most 31 bytes (and a NUL) | A pax `uname`, `gname` record |
+
+The pax records of a member go in one pax `x` header before it, in the order of their keys. Its name is `././@PaxHeader`, with mode 0o644, mtime 0 and owner 0. A field with a pax record has 0 (a number) or the first bytes of the value, cut at the start of a UTF-8 character (a text).
+
+Why pax, and not GNU `L` and `K` headers or base-256 numbers: pax is POSIX, and GNU tar, bsdtar, `roc unbundle` and this reader all read it. One form holds each field that does not fit. This reader refuses base-256 numbers (`BadNumber`), and reads a pax `size`.
+
+This reader reads the pax `path`, `linkpath` and `size` records, and ignores the others. GNU tar and bsdtar read all of them.
+
+### What the writer refuses
+
+The writer refuses a member that the archive cannot hold, that the reader refuses, or that two readers can make in two ways.
+
+| Rule | Error |
+| --- | --- |
+| The path is empty | `BadPath({ path, problem: Empty })` |
+| The path has a NUL byte (the ustar fields end at NUL) | `BadPath({ path, problem: HasNul })` |
+| The path starts with `/` | `BadPath({ path, problem: Absolute })` |
+| The path ends with `/`, but the member is not a directory | `BadPath({ path, problem: TrailingSlash })` |
+| A part between two `/` is empty (`a//b`) | `BadPath({ path, problem: EmptyPart })` |
+| A part is `.` | `BadPath({ path, problem: DotPart })` |
+| A part is `..` | `BadPath({ path, problem: ParentDir })` |
+| A link target is empty | `BadLink({ path, problem: Empty })` |
+| A link target has a NUL byte | `BadLink({ path, problem: HasNul })` |
+| A hard link target is not the path of an earlier regular file or hard link of the archive (tar cannot make the link when it extracts) | `BadLink({ path, problem: NotEarlierFile })` |
+| `uname` or `gname` has a NUL byte | `BadOwnerName({ path })` |
+| `mode` is more than 0o7777 (the type bits are not part of the mode) | `BadMode({ path, mode })` |
+| The path is already in the archive. `a` and `a/` are the same path. Paths are compared byte for byte: `a` and `A` are two paths. | `DuplicatePath({ path })` |
+
+The rules are checked in this order, and the first that fails is the error. The three part rules are checked for each part in turn, after one `/` at the end of a directory is taken off. A symbolic link target can be absolute or have `..`: the writer does not check it. `Tar.create` stops at the first member with an error. After an error of `add`, the writer is as before, so the caller can go on with the next member.
+
+The writer has no limits. The reader has: with `Tar.Limits.{}`, a path of more than 4096 bytes is `PathTooLong`, more than 10000 members is `TooManyMembers`, and a pax header of more than 65536 bytes is `MetaTooLarge`.
+
+`Tar.write_err_to_str` gives an English text for each error.
+
 ## Tar formats
 
 `roc bundle` (roc `src/bundle/bundle.zig`) writes the archive with the Zig standard library `std.tar.Writer`: POSIX ustar headers (magic `ustar\0`, version `00`), regular files only (type `0`, mode 0644, mtime 0), each path in the name field or split at a `/` into the prefix and name fields, and two zero blocks at the end (`finishPedantically`). When a path does not fit in prefix and name (a part of more than 100 bytes), the Zig writer writes a GNU `L` header. `roc unbundle` reads with `std.tar.Iterator`, which reads pax `x` and `g` and GNU `L` and `K`. roc refuses a path of more than 255 bytes.
@@ -187,11 +288,19 @@ All 36 bundles in the local roc cache (2 KB to 100 MB unpacked) have only type `
 | Old GNU header (magic `ustar  \0`) | Yes, with no prefix field | GNU tar `--format=gnu` writes it |
 | V7 (no magic) | No: `NotUstar` | No current tool writes it; with no magic, a random block can look like a header |
 | Base-256 numbers (GNU, for sizes of 8 GiB or more) | No: `BadNumber` | An octal size field holds sizes to 8 GiB, more than each limit here. A pax `size` record gives a larger size if a writer needs it. |
+
+The writer writes POSIX ustar headers and pax `x` headers only (see "How to write").
 | GNU sparse (`S`), volume (`V`), multi-volume (`M`) | As `Other(byte)`, data skipped by its size | The caller decides; the registry refuses each member that is not a file |
 
 ## Usage
 
-Add the release to the header of your app, package or platform:
+Add the release to the header of your app, package or platform. The release candidate with the writer:
+
+```roc
+tar: "https://github.com/lukewilliamboswell/roc-tar/releases/download/0.0.3-rc1/8egXmMy7h6TTkRzUmxWygp2GnPe4mBSNGy5Q2ZZYkppu.tar.zst",
+```
+
+The last release with the reader only:
 
 ```roc
 tar: "https://github.com/Karakatiza666/roc-tar/releases/download/0.0.2/ynGk61syE32Lobjgwd3ZNRURf78xPGxr8Nzi1bSuhUr.tar.zst",
@@ -235,40 +344,48 @@ header_and_paths = |chunks| {
 
 | Layer | Files | Tool |
 | --- | --- | --- |
-| L0 | `tests/header.roc` (fields, types, checksum, octal, magic, paths, `check_path`), `tests/stream.roc` (a split at each byte, chunks of 1 to 1100 bytes, a cut at each byte, the end blocks, padding), `tests/meta.roc` (pax `x` and `g`, GNU `L` and `K`), `tests/limits.roc` (each limit), `tests/portable.roc` (each rule of `check_portable_path` and `roc_accepts`, and the verdicts of `roc bundle` in `tests/fixtures/portable.tsv`, made by `scripts/portable-oracle.sh`), `tests/state.roc` (the state bound), `tests/fixtures.roc` (archives of GNU tar 1.35 in the gnu, pax and ustar formats and of roc bundle, against their `tar -tv`) | `roc test` |
-| L1 | `fuzz/split.roc` (on mutated archives and on any bytes: no crash, and the chunk sizes do not change the result), `fuzz/roundtrip.roc` (random members written with ustar prefix, pax `path` or GNU `L`, read back in random chunks) | [roc-fuzz](https://github.com/lukewilliamboswell/roc-fuzz) 0.4.3 |
+| L0 | `tests/header.roc` (fields, types, checksum, octal, magic, paths, `check_path`), `tests/stream.roc` (a split at each byte, chunks of 1 to 1100 bytes, a cut at each byte, the end blocks, padding), `tests/meta.roc` (pax `x` and `g`, GNU `L` and `K`), `tests/limits.roc` (each limit), `tests/portable.roc` (each rule of `check_portable_path` and `roc_accepts`, and the verdicts of `roc bundle` in `tests/fixtures/portable.tsv`, made by `scripts/portable-oracle.sh`), `tests/state.roc` (the state bound), `tests/fixtures.roc` (archives of GNU tar 1.35 in the gnu, pax and ustar formats and of roc bundle, against their `tar -tv`), `tests/write.roc` (the writer: each header field, the prefix split, each pax record, each error and its text, the chunks of `Tar.writer`, and the bytes of `tests/fixtures/written.tar`) | `roc test` |
+| L1 | `fuzz/split.roc` (on mutated archives and on any bytes: no crash, and the chunk sizes do not change the result), `fuzz/roundtrip.roc` (random members written two ways and read back in random chunks: by a writer in the file, independent of the package, with ustar prefix, pax `path` or GNU `L`; and by `Tar.create` with each member kind and random fields, so each pax record is used, and the chunks of `Tar.writer` are the same bytes) | [roc-fuzz](https://github.com/lukewilliamboswell/roc-fuzz) 0.4.3 |
 | Real bundles | `scripts/bundles.sh [ROC] [FILE.tar.zst...]`: `tests/tools/tarlist.roc` (basic-cli, reads standard input in chunks) against GNU `tar -tv`, for the fixtures and each bundle in the roc cache | basic-cli 0.26.0, GNU tar |
-| Mutations | `scripts/mutants.py ROC [ID...]`: 17 changes to tricky rules of `package/Tar.roc`; each must make a test fail | `roc test` |
+| Writer and tools | `scripts/writer.sh [ROC] [FILE.tar...]`: `tests/tools/tarwrite.roc` (basic-cli) writes a sample with each member kind and each pax record. It must be `tests/fixtures/written.tar`, this reader and GNU `tar -tv` must list the same members, and GNU tar and bsdtar must list and extract it the same (`tests/tools/tartools.py`: mode, owner ids and names, size, path, link, and the extracted bytes, modes, mtimes, links and hard link groups). `FIX=1` writes the fixture again. | basic-cli 0.26.0, GNU tar, bsdtar |
+| Mutations | `scripts/mutants.py ROC [ID...]`: 24 changes to tricky rules of `package/Tar.roc` (17 of the reader, 7 of the writer); each must make a test fail | `roc test` |
 
-`scripts/test.sh [ROC [FUZZ_ROC]]` runs `roc check`, `roc fmt --check`, the L0 tests and the L1 targets. `scripts/fixtures.sh` makes `tests/fixtures/` again. Use the nightly in `.roc-version` (the nightly of the Cloudflare Workers platform 0.0.2). CI (`.github/workflows/ci.yml`) runs the same checks on that nightly. The package also checks and passes `tests/header.roc` on `nightly-2026-10-14-38a3029`.
+`scripts/test.sh [ROC [FUZZ_ROC]]` runs `roc check`, `roc fmt --check`, the L0 tests and the L1 targets. `scripts/fixtures.sh` makes `tests/fixtures/` again. Use the nightly in `.roc-version` (the nightly of the Cloudflare Workers platform 0.0.2). CI (`.github/workflows/ci.yml`) runs the same checks on that nightly. The package also checks and passes `tests/header.roc` on `nightly-2026-10-14-38a3029`, and `scripts/test.sh` passes on `nightly-2026-11-18-a520eed` and Roc `0.1.0_RC1` (2026-11-24).
 
 `scripts/bundles.sh` on 2026-11-01: the 5 fixtures and the 36 bundles of the local roc cache (2 KB to 100 MB unpacked) give the same members as GNU tar 1.35.
 
 ### Mutations
 
-`scripts/mutants.py` on 2026-11-01 (nightly-2026-10-31-f7bef6b). Each mutant changes one rule in `package/Tar.roc`.
+`scripts/mutants.py` on 2026-11-24 (nightly-2026-10-31-f7bef6b). Each mutant changes one rule in `package/Tar.roc`.
 
 | Id | Mutant | Files with a failed test |
 | --- | --- | --- |
-| M1 | chunk split: a partial header takes a whole block from the next chunk | fixtures.roc, stream.roc |
+| M1 | chunk split: a partial header takes a whole block from the next chunk | fixtures.roc, state.roc, stream.roc, write.roc |
 | M2 | 512 padding: a size that is a multiple of 512 gets one more block | stream.roc |
 | M3 | checksum: the last checksum byte is not counted as a space | fixtures.roc |
-| M4 | pax length: the value keeps the newline | fixtures.roc, meta.roc, stream.roc |
-| M5 | pax: an empty `x` value does not delete the `g` value | meta.roc |
+| M4 | pax length: the value keeps the newline | fixtures.roc, meta.roc, state.roc, stream.roc, write.roc |
+| M5 | pax: an empty x value does not delete the g value | meta.roc |
 | M6 | end: a byte after the two zero blocks is accepted | stream.roc |
 | M7 | end: a lone zero block, then a header, is read as a member | stream.roc |
-| M8 | ustar: the prefix and the name are joined with no `/` | fixtures.roc, header.roc |
+| M8 | ustar: the prefix and the name are joined with no '/' | fixtures.roc, header.roc, write.roc |
 | M9 | truncation: an input that ends in the padding is a clean end | stream.roc |
 | M10 | collect: a member of limit + 1 bytes is collected | limits.roc |
 | M11 | portable path: a backslash does not end a part | portable.roc |
-| M12 | portable path: a reserved name is the whole part, not the text before the first `.` | portable.roc |
+| M12 | portable path: a reserved name is the whole part, not the part before the first '.' | portable.roc |
 | M13 | portable path: 256 bytes are good | portable.roc |
-| M14 | state: `max_meta_bytes` does not count the kept pax and GNU values | state.roc |
-| M15 | type byte: NUL is given as `0` (the byte of the kind, not of the header) | header.roc, meta.roc |
-| M16 | `roc_accepts`: `7` is accepted, as its kind is `File` | portable.roc |
-| M17 | `roc_accepts`: a link target is checked with `/` as the only separator | portable.roc |
+| M14 | state: max_meta_bytes does not count the kept pax and GNU values | state.roc |
+| M15 | type byte: NUL is given as '0' (the byte of the kind, not of the header) | header.roc, meta.roc |
+| M16 | roc_accepts: '7' is accepted, as its kind is File | portable.roc |
+| M17 | roc_accepts: a link target is checked with '/' as the only separator | portable.roc |
+| M18 | writer: a ustar prefix of 156 bytes is used | write.roc |
+| M19 | writer: a path of 100 bytes is not in the name field alone | write.roc |
+| M20 | writer: a cut name field ends in the middle of a UTF-8 character | write.roc |
+| M21 | writer: the checksum counts the checksum field as NUL bytes, not spaces | write.roc |
+| M22 | writer: a uname of 32 bytes is in the field (no NUL), not in a pax record | write.roc |
+| M23 | writer: a hard link cannot have a hard link as its target | write.roc |
+| M24 | writer: an mtime of 8589934592 (more than 11 octal digits) is not a pax record | write.roc |
 
-All 17 are killed. M15 to M17: 2026-11-02, the same nightly. M3 is killed only by the fixtures: the test writer puts a space in the last checksum byte, and GNU tar and Zig put a NUL there.
+All 24 are killed (2026-11-24, the same nightly). M3 is killed only by the fixtures of roc bundle: the test writer, the package writer and GNU tar put a space in the last checksum byte, and Zig puts a NUL there.
 
 ## Measurement
 
@@ -335,7 +452,7 @@ Not about tar, for the registry: the zstd decode of the platform is the cost. It
 
 ## Release
 
-`.github/workflows/release.yml` makes a release with [roc-lang/release-package](https://github.com/roc-lang/release-package): `gh workflow run release.yml --ref main -f release_version=X.Y.Z`. The tag is `X.Y.Z` with no prefix, and the one package asset is `<hash>.tar.zst` from `roc bundle`.
+`.github/workflows/release.yml` makes a release with [roc-lang/release-package](https://github.com/roc-lang/release-package): `gh workflow run release.yml --ref main -f release_version=X.Y.Z`. The tag is `X.Y.Z` with no prefix, and the one package asset is `<hash>.tar.zst` from `roc bundle`. A release candidate `X.Y.Z-rcN` (for example `0.0.3-rc1`) is a GitHub prerelease; no other suffix is accepted.
 
 The hash is the hash of `roc bundle main.roc Tar.roc` of this commit with nightly-2026-10-31-f7bef6b (the bundle step of `release.yml`). The release asset has the same name when `package/` does not change. Check the name on the release page before you use the URL.
 
