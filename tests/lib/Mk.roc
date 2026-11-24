@@ -92,12 +92,12 @@ Mk :: [].{
 	end : List(U8)
 	end = List.repeat(0, 1024)
 
-	## A read of `chunks`, in order, then finish.
+	## A read of `pieces`, in order, then finish.
 	run : List(List(U8)), (Tar.Entry -> Tar.Action) -> Try({ events : List(Tar.Event), summary : Tar.Summary }, Tar.Error)
-	run = |chunks, choose| {
+	run = |pieces, choose| {
 		var $t = Tar.new(Tar.Limits.{})
 		var $events = []
-		for c in chunks {
+		for c in pieces {
 			(t2, evs) = $t.push(c, choose)?
 			$t = t2
 			$events = $events.concat(evs)
